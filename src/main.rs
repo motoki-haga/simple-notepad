@@ -8,6 +8,7 @@ struct Notepad {
     path: Option<PathBuf>,
     saved: String,
     status: SharedString,
+    busy: bool,
 }
 
 impl Notepad {
@@ -17,6 +18,7 @@ impl Notepad {
                 .line_number(true).soft_wrap(true).placeholder("ここにメモを入力してください")),
             path: None,
             saved: String::new(),
+            busy: false,
             status: "新しいメモ — UTF-8".into(),
         }
     }
@@ -32,37 +34,68 @@ impl Notepad {
             .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes
     }
 
-    fn save(&mut self, save_as: bool, cx: &mut Context<Self>) {
-        let path = if save_as || self.path.is_none() {
-            rfd::FileDialog::new().add_filter("テキスト", &["txt"])
-                .set_file_name("メモ.txt").save_file()
-        } else { self.path.clone() };
-        let Some(path) = path else { return; };
+    fn save(&mut self, save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy { return; }
+        self.busy = true;
+        let existing = if save_as { None } else { self.path.clone() };
         let text = self.text(cx);
-        match std::fs::write(&path, &text) {
-            Ok(()) => {
-                self.status = format!("保存しました: {}", path.display()).into();
-                self.path = Some(path);
-                self.saved = text;
-            }
-            Err(error) => self.status = format!("保存できません: {error}").into(),
-        }
+        cx.spawn_in(window, async move |view, window| {
+            let path = match existing {
+                Some(path) => Some(path),
+                None => rfd::AsyncFileDialog::new().add_filter("テキスト", &["txt"])
+                    .set_file_name("メモ.txt").save_file().await.map(|file| file.path().to_path_buf()),
+            };
+            let result = if let Some(path) = path {
+                Some(smol::unblock(move || {
+                    let result = std::fs::write(&path, &text);
+                    (path, text, result)
+                }).await)
+            } else { None };
+            let _ = view.update_in(window, |this, _, cx| {
+                this.busy = false;
+                if let Some((path, text, result)) = result {
+                    match result {
+                        Ok(()) => {
+                            this.status = format!("保存しました: {}", path.display()).into();
+                            this.path = Some(path);
+                            this.saved = text;
+                        }
+                        Err(error) => this.status = format!("保存できません: {error}").into(),
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
         cx.notify();
     }
 
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.confirm_discard(cx) { return; }
-        let Some(path) = rfd::FileDialog::new().add_filter("テキスト", &["txt", "md", "log"]).pick_file() else { return; };
-        match std::fs::read_to_string(&path) {
+        if self.busy || !self.confirm_discard(cx) { return; }
+        self.busy = true;
+        cx.spawn_in(window, async move |view, window| {
+            let file = rfd::AsyncFileDialog::new().add_filter("テキスト", &["txt", "md", "log"]).pick_file().await;
+            let result = if let Some(file) = file {
+                let path = file.path().to_path_buf();
+                Some(smol::unblock(move || {
+                    let result = std::fs::read_to_string(&path);
+                    (path, result)
+                }).await)
+            } else { None };
+            let _ = view.update_in(window, |this, window, cx| {
+                this.busy = false;
+                if let Some((path, result)) = result { match result {
             Ok(text) => {
                 let text = text.trim_start_matches('\u{feff}').to_string();
-                self.editor.update(cx, |editor, cx| editor.set_value(text.clone(), window, cx));
-                self.saved = text;
-                self.status = format!("開きました: {}", path.display()).into();
-                self.path = Some(path);
+                this.editor.update(cx, |editor, cx| editor.set_value(text.clone(), window, cx));
+                this.saved = text;
+                this.status = format!("開きました: {}", path.display()).into();
+                this.path = Some(path);
             }
-            Err(error) => self.status = format!("開けません（UTF-8 ファイルを選んでください）: {error}").into(),
-        }
+            Err(error) => this.status = format!("開けません（UTF-8 ファイルを選んでください）: {error}").into(),
+                }}
+                cx.notify();
+            });
+        }).detach();
         cx.notify();
     }
 }
@@ -72,7 +105,7 @@ impl Render for Notepad {
         v_flex().size_full().gap_2().p_3()
             .child(h_flex().gap_2()
                 .child(Button::new("new").label("新規").on_click(cx.listener(|this, _, window, cx| {
-                    if this.confirm_discard(cx) {
+                    if !this.busy && this.confirm_discard(cx) {
                         this.editor.update(cx, |editor, cx| editor.set_value("", window, cx));
                         this.path = None;
                         this.saved.clear();
@@ -81,17 +114,21 @@ impl Render for Notepad {
                     }
                 })))
                 .child(Button::new("open").label("開く").on_click(cx.listener(|this, _, window, cx| this.open(window, cx))))
-                .child(Button::new("save").primary().label("保存").on_click(cx.listener(|this, _, _, cx| this.save(false, cx))))
-                .child(Button::new("save-as").label("名前を付けて保存").on_click(cx.listener(|this, _, _, cx| this.save(true, cx))))
+                .child(Button::new("save").primary().label("保存").on_click(cx.listener(|this, _, window, cx| this.save(false, window, cx))))
+                .child(Button::new("save-as").label("名前を付けて保存").on_click(cx.listener(|this, _, window, cx| this.save(true, window, cx))))
                 .child(Button::new("quit").label("終了").on_click(cx.listener(|this, _, _, cx| {
-                    if this.confirm_discard(cx) { cx.quit(); }
+                    if !this.busy && this.confirm_discard(cx) { cx.quit(); }
                 }))))
-            .child(div().flex_1().min_h_0().child(Editor::new(&self.editor).size_full()))
+            .child(div().flex_1().min_h_0().child(Editor::new(&self.editor).disabled(self.busy).size_full()))
             .child(div().text_sm().child(self.status.clone()))
     }
 }
 
 fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        let path = std::env::temp_dir().join("simple-notepad-crash.log");
+        let _ = std::fs::write(path, format!("{info}\n{}", std::backtrace::Backtrace::force_capture()));
+    }));
     gpui_kit::application().with_assets(Assets).run(|cx| {
         gpui_kit::init(cx);
         gpui_kit::open_window(WindowOptions {
