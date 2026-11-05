@@ -1,0 +1,8 @@
+[package]
+name = "simple-notepad"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "7ec2db24997fd07b020b27656c1bc32f6c9e56c0" }
+rfd = "0.15"
